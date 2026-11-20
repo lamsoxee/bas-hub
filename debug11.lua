@@ -45,12 +45,37 @@ local function log(...)
     label.Text = table.concat(show, "\n")
 end
 
-if not getgenv().BAS_HITHOOK and not getgenv().BAS_H8HOOK then
-    log("NO capture hook - run debug4 first, then debug11 again")
-    return
+if not getgenv().BAS_HITHOOK then
+    getgenv().BAS_HITLOG = {}
+    local targets = {}
+    for _, name in ipairs({ "EggHitRequest", "MasteryPickaxeSwing", "BatHitRequest" }) do
+        local r = RS:FindFirstChild(name)
+        if r then targets[r] = name end
+    end
+    local function ser(v)
+        local t = typeof(v)
+        if t == "Instance" then return "Inst(" .. v:GetFullName() .. ")" end
+        return t .. "(" .. tostring(v) .. ")"
+    end
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        if getnamecallmethod() == "FireServer" and targets[self] then
+            local args = { ... }
+            local parts = {}
+            for i, a in ipairs(args) do parts[#parts + 1] = i .. "=" .. ser(a) end
+            local line = "FIRE " .. targets[self] .. " args: " .. table.concat(parts, " | ")
+            local L = getgenv().BAS_HITLOG
+            if L then L[#L + 1] = line end
+            print("[HIT]", line)
+        end
+        return oldNamecall(self, ...)
+    end)
+    getgenv().BAS_HITHOOK = true
+    log("hook installed by debug11")
+else
+    log("hook already active")
 end
 local hitlog = getgenv().BAS_HITLOG
-if not hitlog then log("BAS_HITLOG missing - run debug4 first") return end
 
 local character = player.Character
 local humanoid = character and character:FindFirstChildOfClass("Humanoid")
