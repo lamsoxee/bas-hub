@@ -1,4 +1,4 @@
--- Break and Steal an Egg - v4: Speed Hub X UI + AutoBreak + Speed
+-- Break and Steal an Egg - v5: Speed Hub X UI + AutoBreak (game controllers) + Speed
 -- UI: Speed Hub X 5.0.0 open source (user-provided). Logic: BAS v4.
 
 local Players = game:GetService("Players")
@@ -2212,38 +2212,48 @@ function Speed_Library:CreateWindow(Config)
   return Tabs
 end
 
-
 -- ============================================================
--- BAS v4 LOGIC - AutoBreak + Speed for Break and Steal an Egg
+-- BAS v5 LOGIC - AutoBreak (game controllers) + Speed
 -- PlaceId 114326934417838 | UI: Speed Hub X 5.0.0 (above)
--- AutoBreak: equip Pickaxe -> walk to nearest egg -> tool:Activate() every 0.25s
---   (the game's own swing delay, per the open-source Area Farm reference).
--- Speed: velocity-based (WalkSpeed is patched in this game) + SlowMode trick.
+--
+-- Built from live protocol tests (2026-11-20):
+-- * A real hit = MasteryPickaxeSwing (no args) + EggHitRequest(eggPart, hitId),
+--   hitId sequential per player. Damage is computed SERVER-side from pickaxe
+--   power - there is no damage argument, so true one-hit is impossible and
+--   self-fired raw hits are ignored by the server (tested: single + paired).
+-- * PickaxeController.Swing(eggPart) fires a real, accepted hit (verified).
+-- * AutoSwingController.SetOn / PickaxeController.SetAutoTargeting are the
+--   game's own auto mode - enabled as a bonus when available.
+-- * Eggs carry the CollectionService tag "BreakableEgg" (on the part named
+--   "Egg"); Health / MaxHealth / Broken attributes live on that part.
+-- * Speed: velocity-based (WalkSpeed is patched in this game) + SlowMode trick.
 -- ============================================================
 
-print("[BASv4] Logic started, PlaceId =", game.PlaceId)
+print("[BASv5] Logic started, PlaceId =", game.PlaceId)
 if game.PlaceId ~= 114326934417838 then
-    warn("[BASv4] WARNING: not in Break and Steal an Egg (PlaceId mismatch)")
+    warn("[BASv5] WARNING: not in Break and Steal an Egg (PlaceId mismatch)")
 end
 
-local BAS_ReplicatedStorage = game:GetService("ReplicatedStorage")
+local BAS_RS = game:GetService("ReplicatedStorage")
+local BAS_CS = game:GetService("CollectionService")
 
 local BAS = {
     SpeedEnabled = false,
     Speed = 200,
     BreakEnabled = false,
     Hits = 0,
+    EggsBroken = 0,
 }
 
 local BAS_Status = nil
 local function basSetStatus(text)
-    print("[BASv4]", text)
+    print("[BASv5]", text)
     if BAS_Status then
         pcall(function() BAS_Status:Set({ "Status", text }) end)
     end
 end
 
--- ===== Speed engine =====
+-- ===== Speed engine (unchanged from v4) =====
 local basMovementLock, basSlowMode, basMovementRemote = nil, nil, nil
 local basOriginalMode, basCurrentMode, basRefreshing = nil, nil, false
 local basLastRefresh, basLastRoot = -math.huge, nil
@@ -2265,8 +2275,8 @@ task.spawn(function()
             end)
         end
     end)
-    pcall(function() basMovementRemote = BAS_ReplicatedStorage:WaitForChild("SlowModeRemote", 5) end)
-    print("[BASv4] Modules: MovementLock =", basMovementLock ~= nil, "| SlowMode =", basSlowMode ~= nil)
+    pcall(function() basMovementRemote = BAS_RS:WaitForChild("SlowModeRemote", 5) end)
+    print("[BASv5] Modules: MovementLock =", basMovementLock ~= nil, "| SlowMode =", basSlowMode ~= nil)
 end)
 
 local function basRestoreMode()
@@ -2316,10 +2326,35 @@ RunService.PreSimulation:Connect(function()
     basLastRoot = root
 end)
 
--- ===== AutoBreak =====
+-- ===== Game controllers (the legit hit pipeline) =====
+local basPC, basASC = nil, nil
+task.spawn(function()
+    pcall(function()
+        local ps = Player:WaitForChild("PlayerScripts", 15)
+        local client = ps and ps:WaitForChild("Client", 10)
+        local controllers = client and client:WaitForChild("Controllers", 10)
+        if controllers then
+            pcall(function() basPC = require(controllers:WaitForChild("PickaxeController", 5)) end)
+            pcall(function() basASC = require(controllers:WaitForChild("AutoSwingController", 5)) end)
+        end
+    end)
+    print("[BASv5] Controllers: Pickaxe =", basPC ~= nil, "| AutoSwing =", basASC ~= nil)
+end)
+
+local function basSetGameAuto(on)
+    if basPC and basPC.SetAutoTargeting then
+        pcall(function() basPC.SetAutoTargeting(on) end)
+    end
+    if basASC and basASC.SetOn then
+        pcall(function() basASC.SetOn(on) end)
+    end
+end
+
+-- ===== AutoBreak v5 =====
 local BAS_TOOL = "Pickaxe"
-local BAS_REACH = 12
-local BAS_SWING = 0.25
+local BAS_REACH = 10
+local BAS_SWING = 0.3
+local BAS_EGG_TIMEOUT = 45
 
 local function basGetChar()
     local character = Player.Character
@@ -2341,29 +2376,27 @@ local function basFindPickaxe(character)
     return search(character) or search(Player:FindFirstChildOfClass("Backpack"))
 end
 
-local function basEggPos(obj)
-    if obj:IsA("BasePart") then return obj.Position end
-    if obj:IsA("Model") then
-        if obj.PrimaryPart then return obj.PrimaryPart.Position end
-        local part = obj:FindFirstChildWhichIsA("BasePart", true)
-        if part then return part.Position end
-    end
-    return nil
+local basSkip = {} -- part -> os.clock() expiry
+
+local function basEggBroken(part)
+    if not part or not part.Parent then return true end
+    if part:GetAttribute("Broken") == true then return true end
+    local h = part:GetAttribute("Health")
+    if h ~= nil and h <= 0 then return true end
+    return false
 end
 
 local function basNearestEgg(rootPos)
-    local searchRoot = workspace
-    local build = workspace:FindFirstChild("Build")
-    if build and build:FindFirstChild("ZoneBuilds") then
-        searchRoot = build.ZoneBuilds
-    end
+    local tagged = {}
+    pcall(function() tagged = BAS_CS:GetTagged("BreakableEgg") end)
     local best, bestDist = nil, math.huge
-    for _, obj in ipairs(searchRoot:GetDescendants()) do
-        if (obj:IsA("Model") or obj:IsA("BasePart")) and string.find(string.lower(obj.Name), "egg") then
-            local pos = basEggPos(obj)
-            if pos then
-                local dist = (pos - rootPos).Magnitude
-                if dist < bestDist then best, bestDist = obj, dist end
+    for _, obj in ipairs(tagged) do
+        local part = obj:IsA("BasePart") and obj or (obj:IsA("Model") and (obj:FindFirstChild("Egg") or obj.PrimaryPart))
+        if part and part.Parent and not basEggBroken(part) then
+            local skipUntil = basSkip[part]
+            if not skipUntil or os.clock() > skipUntil then
+                local dist = (part.Position - rootPos).Magnitude
+                if dist < bestDist then best, bestDist = part, dist end
             end
         end
     end
@@ -2374,32 +2407,60 @@ local basBreakGen = 0
 local function basStartBreak()
     basBreakGen = basBreakGen + 1
     local gen = basBreakGen
+    basSetGameAuto(true)
     task.spawn(function()
+        local currentEgg, eggSince = nil, 0
         while BAS.BreakEnabled and gen == basBreakGen do
             local character, humanoid, root = basGetChar()
             if character and humanoid and root and humanoid.Health > 0 then
                 local tool = basFindPickaxe(character)
-                if tool and tool.Parent == Player:FindFirstChildOfClass("Backpack") then
+                if tool and tool.Parent ~= character then
                     pcall(function() humanoid:EquipTool(tool) end)
+                    task.wait(0.2)
                     tool = basFindPickaxe(character)
                 end
 
-                local egg, dist = basNearestEgg(root.Position)
-                if egg then
-                    local eggPos = basEggPos(egg)
-                    if eggPos and dist > BAS_REACH then
-                        humanoid:MoveTo(eggPos)
-                        basSetStatus("Walk to: " .. egg.Name .. " (" .. math.floor(dist) .. ")")
-                    elseif eggPos then
-                        root.CFrame = CFrame.new(root.Position, Vector3.new(eggPos.X, root.Position.Y, eggPos.Z))
-                        if tool then
-                            pcall(function() tool:Activate() end)
-                            BAS.Hits = BAS.Hits + 1
-                            basSetStatus("Hitting: " .. egg.Name .. " | hits: " .. BAS.Hits)
+                if currentEgg and basEggBroken(currentEgg) then
+                    BAS.EggsBroken = BAS.EggsBroken + 1
+                    basSetStatus("Egg broken! total: " .. BAS.EggsBroken .. " | hits: " .. BAS.Hits)
+                    currentEgg = nil
+                end
+
+                if not currentEgg then
+                    local egg = basNearestEgg(root.Position)
+                    currentEgg = egg
+                    eggSince = os.clock()
+                end
+
+                if currentEgg then
+                    if os.clock() - eggSince > BAS_EGG_TIMEOUT then
+                        basSkip[currentEgg] = os.clock() + 30
+                        currentEgg = nil
+                    else
+                        local dist = (currentEgg.Position - root.Position).Magnitude
+                        local eggName = (currentEgg.Parent and currentEgg.Parent.Name) or currentEgg.Name
+                        if dist > BAS_REACH then
+                            humanoid:MoveTo(currentEgg.Position)
+                            basSetStatus("Walk to: " .. eggName .. " (" .. math.floor(dist) .. ")")
                         else
-                            basSetStatus("No Pickaxe found - equip one first")
+                            root.CFrame = CFrame.new(root.Position, Vector3.new(currentEgg.Position.X, root.Position.Y, currentEgg.Position.Z))
+                            local swung = false
+                            if basPC and basPC.Swing then
+                                swung = pcall(function() basPC.Swing(currentEgg) end)
+                            end
+                            if not swung and tool then
+                                pcall(function() tool:Activate() end)
+                                swung = true
+                            end
+                            if swung then
+                                BAS.Hits = BAS.Hits + 1
+                                local hp = currentEgg:GetAttribute("Health")
+                                basSetStatus("Hitting: " .. eggName .. (hp and (" | HP " .. hp) or "") .. " | hits: " .. BAS.Hits)
+                            else
+                                basSetStatus("Swing failed - no Pickaxe?")
+                            end
+                            task.wait(BAS_SWING)
                         end
-                        task.wait(BAS_SWING)
                     end
                 else
                     basSetStatus("No egg found - move to a zone first")
@@ -2411,7 +2472,7 @@ local function basStartBreak()
 end
 
 -- ===== UI wiring (Speed Hub X library) =====
-local BAS_Window = Speed_Library:CreateWindow({ "Break & Steal Egg", "BAS v4 - AutoBreak + Speed" })
+local BAS_Window = Speed_Library:CreateWindow({ "Break & Steal Egg", "BAS v5 - AutoBreak + Speed" })
 local BAS_Tab = BAS_Window:CreateTab({ "Farm" })
 local BAS_Main = BAS_Tab:AddSection("Main", true)
 
@@ -2427,19 +2488,20 @@ BAS_Main:AddSlider({ "Speed Value", "16 - 400, default 200", 1, 16, 400, 200, fu
     BAS.Speed = value
 end })
 
-BAS_Main:AddToggle({ "Auto Break", "Equip pickaxe, walk to nearest egg, auto swing", false, function(value)
+BAS_Main:AddToggle({ "Auto Break", "Walk to nearest egg, break it via the game's own swing", false, function(value)
     BAS.BreakEnabled = value
     if value then
         basStartBreak()
     else
         basBreakGen = basBreakGen + 1
-        basSetStatus("AutoBreak OFF | total hits: " .. BAS.Hits)
+        basSetGameAuto(false)
+        basSetStatus("AutoBreak OFF | eggs: " .. BAS.EggsBroken .. " | hits: " .. BAS.Hits)
     end
 end })
 
 local BAS_Info = BAS_Tab:AddSection("Info", false)
-BAS_Info:AddParagraph({ "How to use", "Turn on Speed, set value, turn on Auto Break near an egg zone. Status shows the target egg + hit count." })
-BAS_Info:AddParagraph({ "Note", "Test on an alt account first. If status says 'No egg found' while standing at an egg, report the exact status text." })
+BAS_Info:AddParagraph({ "How to use", "Stand in an egg zone, turn on Auto Break. It walks to the nearest egg and breaks it with the game's own PickaxeController swing, then moves to the next egg." })
+BAS_Info:AddParagraph({ "About one-hit", "Tested live: damage is calculated by the server from your pickaxe power - the hit remote carries no damage value, and self-fired hits are ignored. True one-hit does not exist for this game; v5 breaks at the fastest legit swing rate instead." })
 
-Speed_Library:SetNotification({ "BAS v4", "Loaded", "AutoBreak + Speed ready" })
-print("[BASv4] Ready")
+Speed_Library:SetNotification({ "BAS v5", "Loaded", "AutoBreak + Speed ready" })
+print("[BASv5] Ready")
