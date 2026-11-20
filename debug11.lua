@@ -31,6 +31,16 @@ label.TextXAlignment = Enum.TextXAlignment.Left
 label.TextYAlignment = Enum.TextYAlignment.Top
 label.Text = "BAS T11 running..."
 label.Parent = frame
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 34, 0, 26)
+closeBtn.Position = UDim2.new(1, -40, 0, 6)
+closeBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.Font = Enum.Font.Code
+closeBtn.TextSize = 14
+closeBtn.Text = "X"
+closeBtn.Parent = frame
+closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
 
 local out = {}
 getgenv().BAS_T11 = out
